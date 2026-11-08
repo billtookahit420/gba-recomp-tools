@@ -33,15 +33,19 @@ import json
 import os
 import re
 import shutil
+import signal
 import struct
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import urllib.request
 import zipfile
 import zlib
 from pathlib import Path
+
+APP_VERSION = "1.0.1"
 
 APP_DIR = Path(__file__).resolve().parent.parent
 FRAMEWORK_CACHE = APP_DIR / "framework-cache"
@@ -166,24 +170,54 @@ def log_line(log, msg):
 
 
 def _run(cmd, log, cwd=None, timeout=3600, env=None):
-    log_line(log, "+ " + " ".join(str(c) for c in cmd))
+    """Run a child, streaming its output to the log, with a REAL
+    wall-clock timeout.
+
+    Sibling of the GBRecomp Tools v1.0.1 fix (Duane, 2026-11-05):
+    the old structure read the child's output stream to its end
+    BEFORE starting the wait, so for a child that prints nothing
+    and never exits, the stream never ended, the wait never
+    started, and the TimeoutExpired kill branch below it was
+    unreachable — a silent child hung the queue forever. The
+    deadline is now enforced against the process itself: output
+    is drained on a thread, and when the clock runs out the
+    child's whole process group is killed and a RuntimeError
+    names the full command and the timeout."""
+    cmd = [str(c) for c in cmd]
+    log_line(log, "+ " + " ".join(cmd))
     run_env = dict(os.environ)
     if env:
         run_env.update(env)
     proc = subprocess.Popen(
-        [str(c) for c in cmd], cwd=cwd, env=run_env,
+        cmd, cwd=cwd, env=run_env,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, errors="replace", bufsize=1)
+        text=True, errors="replace", bufsize=1,
+        start_new_session=True)
+
+    def _drain():
+        try:
+            for line in proc.stdout:
+                log_line(log, line.rstrip("\n"))
+        except (ValueError, OSError):
+            pass
+
+    reader = threading.Thread(target=_drain, daemon=True)
+    reader.start()
     try:
-        for line in proc.stdout:
-            log_line(log, line.rstrip("\n"))
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        proc.kill()
-        raise RuntimeError(f"command timed out after {timeout}s: {cmd[0]}")
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
+        proc.wait()
+        reader.join(timeout=5)
+        raise RuntimeError(
+            f"timed out after {timeout} s and was killed: {' '.join(cmd)}")
+    reader.join(timeout=5)
     if proc.returncode != 0:
         raise RuntimeError(
-            f"command failed ({proc.returncode}): {' '.join(map(str, cmd))}")
+            f"command failed ({proc.returncode}): {' '.join(cmd)}")
     return proc.returncode
 
 

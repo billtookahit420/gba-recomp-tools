@@ -1,5 +1,10 @@
 # GBARecomp Tools
 
+**Version 1.0.1** — every conversion subprocess now has a real
+wall-clock timeout that fires even when the child is silent, so a
+hung child fails its queue item instead of stalling the batch
+forever; see RELEASE-NOTES-v1.0.1.md.
+
 Convert your own Game Boy Advance ROM dumps into native PC games —
 no emulator: each game's ARM code is statically recompiled to a
 real executable with a launcher, box art, RetroAchievements and
