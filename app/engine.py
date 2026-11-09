@@ -45,7 +45,7 @@ import zipfile
 import zlib
 from pathlib import Path
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 
 APP_DIR = Path(__file__).resolve().parent.parent
 FRAMEWORK_CACHE = APP_DIR / "framework-cache"
@@ -161,12 +161,10 @@ GBA_SUBMODULES = ["external/arm-recomp-core", "external/rbengine",
 
 
 def log_line(log, msg):
-    line = str(msg)
     if log:
-        log.write(line + "\n")
-        log.flush()
+        log(str(msg))
     else:
-        print(line, flush=True)
+        print(msg, flush=True)
 
 
 def _run(cmd, log, cwd=None, timeout=3600, env=None):
@@ -1240,7 +1238,7 @@ def package(job, probe, proj, camel, title, cover, bdir, exe, target,
 # Job runner
 # ---------------------------------------------------------------------------
 
-def run_job(job, log):
+def run_job(job, log=None):
     rom = Path(job["rom"])
     if not rom.exists():
         raise RuntimeError(f"ROM not found: {rom}")
@@ -1299,7 +1297,7 @@ def main(argv):
         return 0
     if len(argv) >= 4 and argv[1] == "run" and argv[2] == "--job":
         job = json.loads(Path(argv[3]).read_text())
-        result = run_job(job, sys.stdout)
+        result = run_job(job)
         print(json.dumps(result, indent=1))
         return 0
     print("usage: engine.py probe <rom> | toolbox | run --job <json>")

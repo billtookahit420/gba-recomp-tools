@@ -1,9 +1,9 @@
 # GBARecomp Tools
 
-**Version 1.0.1** — every conversion subprocess now has a real
-wall-clock timeout that fires even when the child is silent, so a
-hung child fails its queue item instead of stalling the batch
-forever; see RELEASE-NOTES-v1.0.1.md.
+**Version 1.0.2** — GUI queue runs work again: the engine's log
+helper now takes the same callable log target the GUI passes (it
+previously expected a file stream, so every queued job failed
+instantly); see RELEASE-NOTES-v1.0.2.md.
 
 Convert your own Game Boy Advance ROM dumps into native PC games —
 no emulator: each game's ARM code is statically recompiled to a
