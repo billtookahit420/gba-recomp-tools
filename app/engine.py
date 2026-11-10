@@ -45,7 +45,7 @@ import zipfile
 import zlib
 from pathlib import Path
 
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 
 APP_DIR = Path(__file__).resolve().parent.parent
 FRAMEWORK_CACHE = APP_DIR / "framework-cache"
@@ -657,6 +657,115 @@ def ensure_frameworks(log):
     return gba_dir, ui_dir
 
 
+
+
+# ---------------------------------------------------------------------------
+# GBA bridge-escalation patch (engine patch, fail-loud — same discipline
+# as the SNES tool's interp-bridge patch).
+#
+# The upstream gbarecomp self-heal bridge interprets a missed call
+# subtree until it returns to one pushed address, with a 200M-instruction
+# runaway cap. Two guest shapes can never satisfy that contract: a
+# routine that never returns by design (a RAM-resident player main loop
+# — the GBA Video carts), and a bounded wait on interrupt-advanced
+# state (Halt frame-sync inside a callback subtree — Extreme
+# Ghostbusters) whose progress in-bridge IRQ servicing does not
+# deliver. Both aborted at the cap. This patch teaches the bridge to
+# escalate at a 1M-instruction budget: synchronously heal the entry PC
+# and the current PC and re-dispatch the current PC natively with the
+# call-return frame left on the stack. It also fixes the overlay shard
+# codegen defect that made heals fail to compile for any function with
+# mid-function resume entries ('g_runtime_resume_pc' was never exposed
+# through the overlay ABI), and makes heal failure on the escalation
+# path retryable instead of latched in s_failed.
+#
+# Anchors are byte-exact against upstream gbarecomp @ c1a5fda. If the
+# framework has moved (anchors match neither pristine nor patched),
+# the job FAILS LOUDLY — it never silently ships an unpatched bridge.
+# ---------------------------------------------------------------------------
+
+_BRIDGE_PATCH_FILES = {
+    'src/runtime/overlay_abi.h': [
+        ('#endif\n\n#define GBA_OVERLAY_ABI_VERSION 6u\n\ntypedef struct GbaOverlayCallbacks {\n',
+         '#endif\n\n#define GBA_OVERLAY_ABI_VERSION 7u\n\ntypedef struct GbaOverlayCallbacks {\n'),
+        ('    uint32_t (*runtime_prefetch_stall_delta)(uint32_t wait, uint32_t pc,\n                                             uint32_t thumb);\n} GbaOverlayCallbacks;\n\n',
+         "    uint32_t (*runtime_prefetch_stall_delta)(uint32_t wait, uint32_t pc,\n                                             uint32_t thumb);\n\n    // ABI v7: generated bodies with mid-function alias (resume) entries read\n    // and clear the host's g_runtime_resume_pc in their prologue\n    // (emit_function.cpp). Shards compiled before v7 referenced the symbol\n    // with no declaration in the overlay shim and failed to build, so any\n    // function class carrying resume entries could never heal.\n    uint32_t* runtime_resume_pc;    // &g_runtime_resume_pc\n} GbaOverlayCallbacks;\n\n"),
+    ],
+    'src/runtime/overlay_runtime_arm.h': [
+        ('#define g_runtime_cycles (*g_ovl->runtime_cycles)\n#define g_runtime_break_pc (*g_ovl->runtime_break_pc)\n#define g_runtime_fn_entry_hook (*g_ovl->runtime_fn_entry_hook)\n#define g_runtime_trace_enabled (*g_ovl->runtime_trace_enabled)\n',
+         '#define g_runtime_cycles (*g_ovl->runtime_cycles)\n#define g_runtime_break_pc (*g_ovl->runtime_break_pc)\n#define g_runtime_resume_pc (*g_ovl->runtime_resume_pc)\n#define g_runtime_fn_entry_hook (*g_ovl->runtime_fn_entry_hook)\n#define g_runtime_trace_enabled (*g_ovl->runtime_trace_enabled)\n'),
+    ],
+    'src/runtime/overlay_loader.h': [
+        ("bool overlay_request_compile(uint32_t pc, bool thumb);\n\n// Game-thread: move any worker-finished entries into g_healed (and remember\n// failures so they aren't retried). Cheap when idle (one atomic load). Call\n",
+         "bool overlay_request_compile(uint32_t pc, bool thumb);\n\n// Synchronous heal attempt for the bridge's budget-escalation path\n// (runtime_arm_default_aborts.cpp). Unlike overlay_request_compile this\n// compiles on the calling (game) thread when no shard exists yet, snapshots\n// RAM regions without the Stage-4 env gate, and NEVER consults or sets the\n// s_failed latch: a failed escalation stays retryable at the next budget\n// multiple instead of sentencing the PC to the interpreter bridge forever.\n// Returns true only when the PC is dispatchable immediately on return.\nbool overlay_escalate_heal(uint32_t pc, bool thumb);\n\n// Game-thread: move any worker-finished entries into g_healed (and remember\n// failures so they aren't retried). Cheap when idle (one atomic load). Call\n"),
+    ],
+    'src/runtime/overlay_loader.cpp': [
+        ('}\n\nbool snapshot_ram_region(uint32_t pc, OverlayWorkItem* w) {\n    if (!ram_overlay_heal_enabled() || !w) return false;\n    gba::GbaBus* bus = active_bus();\n    if (!bus) return false;\n',
+         '}\n\nbool snapshot_ram_region(uint32_t pc, OverlayWorkItem* w,\n                         bool bypass_env_gate = false) {\n    if ((!bypass_env_gate && !ram_overlay_heal_enabled()) || !w) return false;\n    gba::GbaBus* bus = active_bus();\n    if (!bus) return false;\n'),
+        ('    g_callbacks.runtime_cycles     = &g_runtime_cycles;\n    g_callbacks.runtime_break_pc   = &g_runtime_break_pc;\n    g_callbacks.runtime_fn_entry_hook = &g_runtime_fn_entry_hook;\n    g_callbacks.gba_mod_function_entry = gba_mod_function_entry;\n',
+         '    g_callbacks.runtime_cycles     = &g_runtime_cycles;\n    g_callbacks.runtime_break_pc   = &g_runtime_break_pc;\n    g_callbacks.runtime_resume_pc  = &g_runtime_resume_pc;\n    g_callbacks.runtime_fn_entry_hook = &g_runtime_fn_entry_hook;\n    g_callbacks.gba_mod_function_entry = gba_mod_function_entry;\n'),
+        ('}\n\nvoid overlay_drain_ready() {\n    if (s_ready_pending.load(std::memory_order_acquire) == 0) return;\n',
+         '}\n\nbool overlay_escalate_heal(uint32_t pc, bool thumb) {\n    if (!s_active) return false;\n    pc &= ~1u;\n    const uint64_t key = heal_key(pc, thumb);\n    // A background compile may have landed since the last frame boundary;\n    // the bridge never returns to the runner, so drain here (game thread).\n    overlay_drain_ready();\n    if (g_healed.count(key)) return true;\n    // A background compile for this PC is already in flight: let it land\n    // rather than duplicating it synchronously; the next budget multiple\n    // drains again and finds it.\n    if (s_inflight.count(key)) return false;\n\n    OverlayWorkItem w;\n    w.pc = pc;\n    w.thumb = thumb;\n    const uint8_t* bytes = nullptr;\n    std::size_t size = 0;\n    uint32_t base = 0;\n    if (region_bytes(pc, &bytes, &size, &base)) {\n        w.bytes = bytes;\n        w.size = size;\n        w.base = base;\n    } else if (!snapshot_ram_region(pc, &w, /*bypass_env_gate=*/true)) {\n        // No code image for this PC at all (unmapped region): nothing a\n        // heal could compile. Not a failure worth latching — the bridge\n        // keeps its 200M backstop for this subtree.\n        return false;\n    }\n\n    // Synchronous compile on the game thread (the GBARECOMP_SYNC_OVERLAY_HEAL\n    // path in overlay_request_compile is the precedent: escalation is rare —\n    // once per budget multiple per runaway bridge — and the alternative is\n    // interpreting until the runaway cap). DELIBERATELY no s_failed insert\n    // on failure: the escalation caller retries at the next budget multiple,\n    // so a transient compile failure (or a shard defect fixed mid-session)\n    // must not permanently pin this PC to the bridge.\n    OverlayCompiled c;\n    std::string err;\n    const bool ok = overlay_compile_one(w, s_active_cache_dir, &g_callbacks,\n                                        /*compile_if_missing=*/true, s_backend,\n                                        &c, &err);\n    if (!ok) {\n        if (self_heal_verbose()) {\n            std::fprintf(stderr,\n                "self_heal: escalation compile FAILED for 0x%08X (%s): %s - "\n                "bridge continues; will retry at the next budget multiple.\\n",\n                pc, thumb ? "thumb" : "arm", err.c_str());\n        }\n        return false;\n    }\n    install_healed(key, c);\n    if (self_heal_verbose()) {\n        std::fprintf(stderr,\n            "self_heal: HEALED %s0x%08X (%s) -> native via %s (crc=%08X, "\n            "[0x%08X,0x%08X)) by bridge escalation.\\n",\n            !w.owned_bytes.empty() ? "RAM " : "",\n            pc, thumb ? "thumb" : "arm", heal_backend_name(s_backend),\n            c.crc, pc, c.end);\n    }\n    return true;\n}\n\nvoid overlay_drain_ready() {\n    if (s_ready_pending.load(std::memory_order_acquire) == 0) return;\n'),
+    ],
+    'src/runtime/runtime_arm_default_aborts.cpp': [
+        ("// forever. Far above any real BIOS/cart subroutine length.\nconstexpr std::uint64_t kBridgeIterationCap = 200'000'000ull;\n\n// Always-on, per-bridge history of the most recent control transfers, kept on\n",
+         "// forever. Far above any real BIOS/cart subroutine length.\nconstexpr std::uint64_t kBridgeIterationCap = 200'000'000ull;\n\n// Bridge-budget escalation: when one bridge crosses this many interpreted\n// instructions it is no longer plausibly a subroutine (real BIOS/cart\n// subroutines return in hundreds-to-thousands), so the bridge tries to hand\n// the LIVE execution over to native code instead of interpreting on toward\n// the cap: heal the entry PC and the current PC, then re-dispatch the\n// current PC natively with the bridge's call-return frame left on the\n// stack. Two guest shapes need this: a routine that never returns by\n// design (a RAM-resident player main loop called at startup), and a\n// bounded-on-hardware wait on interrupt-advanced state (Halt frame-sync)\n// whose progress the in-bridge IRQ servicing does not deliver — natively\n// the same wait completes and returns through the ordinary return path.\n// Failed attempts retry at each subsequent budget multiple; the 200M cap\n// above stays as the backstop for genuine runaways.\nconstexpr std::uint64_t kBridgeEscalationBudget = 1'000'000ull;\n\n// Always-on, per-bridge history of the most recent control transfers, kept on\n"),
+        ('    const std::uint32_t entry_floor = runtime_call_stack_floor();\n    std::uint32_t unwound_depth = UINT32_MAX;\n    for (;;) {\n        // Sync interp -> g_cpu (pre-execution state) so the fingerprint ring,\n',
+         '    const std::uint32_t entry_floor = runtime_call_stack_floor();\n    std::uint32_t unwound_depth = UINT32_MAX;\n    // Budget-escalation hand-off (see kBridgeEscalationBudget). Attempts a\n    // synchronous heal of the entry PC (so future dispatches of it go native\n    // immediately) and of the current PC (a resume shard when the bridge has\n    // wandered outside the entry\'s region — BIOS epilogue entry, execution\n    // now in a RAM/ROM wait loop), then re-dispatches the current PC\n    // natively. The interpreter state is written back exactly as the normal\n    // exit writes it, but the entry call-return stack is restored WITH the\n    // bridge\'s frame in place (minus the frame only when the native subtree\n    // actually returned to stop_pc, or trimmed to an outer frame it\n    // returned past): when the natively-running subtree eventually returns\n    // to stop_pc, generated code\'s ordinary runtime_call_should_return\n    // handling unwinds it exactly as if the call had been native all along.\n    // Returns true when the hand-off happened (the caller then returns from\n    // the bridge at once — the interpreter copy is stale from here on).\n    std::uint64_t next_escalation = kBridgeEscalationBudget;\n    auto bridge_try_escalate = [&]() -> bool {\n        const std::uint32_t cur_pc = cpu.R[15] & ~1u;\n        const bool cur_thumb = cpu.thumb;\n        gbarecomp::store_interp_into_arm_cpu(cpu, g_cpu);\n        bus->set_bios_access_enabled(cur_pc < 0x00004000u);\n        gbarecomp::overlay_escalate_heal(entry_pc, entry_thumb);\n        bool can_native =\n            gbarecomp::overlay_query(cur_pc, cur_thumb, nullptr) ||\n            runtime_has_static_entry(cur_pc, cur_thumb ? 1 : 0) != 0;\n        if (!can_native)\n            can_native = gbarecomp::overlay_escalate_heal(cur_pc, cur_thumb);\n        if (!can_native) return false;\n        if (self_heal_verbose())\n            std::fprintf(stderr,\n                "runtime_arm: SELF-HEAL bridge for 0x%08X escalating at %llu "\n                "insns: transferring to native at pc=0x%08X (%s), stop_pc "\n                "0x%08X frame left on the call-return stack\\n",\n                entry_pc, static_cast<unsigned long long>(bridged_insns),\n                cur_pc, cur_thumb ? "thumb" : "arm", stop_pc);\n        // Fold this bridge\'s interpreted instructions into the session\n        // tally now: what runs next is native, not bridged.\n        g_interp_insns += bridged_insns;\n        if (gbarecomp::overlay_query(cur_pc, cur_thumb, nullptr))\n            overlay_try_dispatch(cur_pc, cur_thumb ? 1 : 0);\n        else\n            runtime_dispatch(cur_pc);\n        const std::uint32_t landed = g_cpu.R[15] & ~1u;\n        bus->set_bios_access_enabled(landed < 0x00004000u);\n        if (!top_level && !irq_cont) {\n            std::uint32_t depth = entry_depth;  // frame left in place\n            if (landed == stop_pc) {\n                depth = entry_depth - 1;        // the subtree returned\n            } else {\n                // Returned past the bridge\'s frame into an outer frame,\n                // mirroring the unwound_depth handling at the normal exit.\n                for (std::uint32_t slot = entry_depth - 1u;\n                     slot-- > entry_floor;) {\n                    if ((entry_stack[slot] & ~1u) == landed) {\n                        depth = slot;\n                        break;\n                    }\n                }\n            }\n            runtime_call_stack_restore(entry_stack.data(), depth);\n        }\n        return true;\n    };\n    for (;;) {\n        // Sync interp -> g_cpu (pre-execution state) so the fingerprint ring,\n'),
+        ("        }\n\n        if (++iters > cap) {\n            if (max_instrs != 0u) {\n                // Gate (bounded) mode: the validation's interp pass didn't reach\n",
+         "        }\n\n        ++iters;\n        // Budget escalation (see kBridgeEscalationBudget): never in the\n        // bounded gate pass (max_instrs != 0 — a validation run must stay a\n        // pure interpreter pass) and never in an IRQ continuation (those\n        // already heal-to-static above). On a landed hand-off the bridge is\n        // done: native code owns the subtree from the current PC.\n        if (forced_stop_pc == 0u && max_instrs == 0u && !irq_cont &&\n            bridged_insns >= next_escalation) {\n            next_escalation += kBridgeEscalationBudget;\n            if (bridge_try_escalate()) return 1;\n        }\n\n        if (iters > cap) {\n            if (max_instrs != 0u) {\n                // Gate (bounded) mode: the validation's interp pass didn't reach\n"),
+    ],
+}
+
+
+def _patch_gba_bridge(gba_dir, log):
+    """Apply the bridge-escalation patch to the resolved framework
+    checkout (see the section comment above). Idempotent; fail-loud."""
+    datas = {}
+    states = {}
+    for rel, hunks in _BRIDGE_PATCH_FILES.items():
+        path = gba_dir.joinpath(*rel.split("/"))
+        if not path.exists():
+            raise RuntimeError(
+                "gba bridge patch: framework file missing: " + str(path))
+        data = path.read_bytes()
+        datas[rel] = (path, data)
+        news = [new.encode("utf-8") in data for _, new in hunks]
+        if all(news):
+            states[rel] = "applied"
+        elif not any(news) and all(
+                data.count(old.encode("utf-8")) == 1 for old, _ in hunks):
+            states[rel] = "pristine"
+        else:
+            raise RuntimeError(
+                "gba bridge patch: anchors for " + rel + " match neither "
+                "the pristine nor the patched framework — the framework "
+                "has moved; re-base the patch in app/engine.py instead "
+                "of shipping an unpatched bridge (long-running RAM/BIOS "
+                "call subtrees would abort at the 200M bridge cap)")
+    if all(s == "applied" for s in states.values()):
+        log_line(log, "gba bridge patch: already applied")
+        return
+    if any(s == "applied" for s in states.values()):
+        raise RuntimeError(
+            "gba bridge patch: partially applied framework tree "
+            "(mixed pristine/patched files) — refusing to ship it; "
+            "restore a clean framework checkout and re-run")
+    for rel, hunks in _BRIDGE_PATCH_FILES.items():
+        path, data = datas[rel]
+        for old, new in hunks:
+            old_b = old.encode("utf-8")
+            if data.count(old_b) != 1:
+                raise RuntimeError(
+                    "gba bridge patch: pristine anchor not found exactly "
+                    "once in " + rel + " — the framework has moved; "
+                    "re-base the patch in app/engine.py instead of "
+                    "shipping an unpatched bridge")
+            data = data.replace(old_b, new.encode("utf-8"), 1)
+        path.write_bytes(data)
+    log_line(log, "patched gbarecomp: bridge budget escalation + "
+                  "overlay resume-pc ABI (bridge-abort fix)")
+
 # ---------------------------------------------------------------------------
 # Project scaffold: game.toml + the generic host (modelled on the
 # framework's own reference game, SuperMarioAdvance4Recomp: game-root
@@ -1254,6 +1363,7 @@ def run_job(job, log=None):
         ra_on = False
     netplay_on = bool(job.get("netplay", True))
     gba_dir, ui_dir = ensure_frameworks(log)
+    _patch_gba_bridge(gba_dir, log)
     proj, camel, title, cover = scaffold_project(
         job, probe, gba_dir, ui_dir, log, ra_on=ra_on,
         netplay_on=netplay_on)

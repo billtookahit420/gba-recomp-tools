@@ -1,9 +1,11 @@
 # GBARecomp Tools
 
-**Version 1.0.2** — GUI queue runs work again: the engine's log
-helper now takes the same callable log target the GUI passes (it
-previously expected a file stream, so every queued job failed
-instantly); see RELEASE-NOTES-v1.0.2.md.
+**Version 1.0.3** — bridge-starvation fix: games whose bridged
+calls wait on interrupt-driven progress (the GBA Video players;
+Extreme Ghostbusters' audio callbacks) no longer abort at the
+runtime's 200M-instruction bridge cap — the engine patches the
+framework at conversion time with a budget-escalation heal and
+a heal-codegen fix; see RELEASE-NOTES-v1.0.3.md.
 
 Convert your own Game Boy Advance ROM dumps into native PC games —
 no emulator: each game's ARM code is statically recompiled to a
